@@ -1,4 +1,10 @@
 import os
+import time
+import hashlib
+import pickle
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 import sys
 import numpy as np
 import torch
@@ -13,7 +19,7 @@ from PyQt5.QtWidgets import (
     QLabel, QWidget, QScrollArea, QGridLayout, QPushButton, QMessageBox
 )
 from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSize, QTimer, QMetaObject, Q_ARG, QThread, pyqtSlot
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,29 +31,16 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class AdvancedImageIndexer:
     def __init__(self, root_directory: str, cache_path: str = 'image_index_cache.pkl'):
-        """
-        Advanced image indexer with robust error handling and semantic matching
-
-        Args:
-            root_directory (str): Root directory to index images
-            cache_path (str): Path to store index cache
-        """
         self.root_directory = root_directory
         self.cache_path = cache_path
         self.index = None
+        self.failed_files = set()  # Track files that fail embedding generation
+
         self.file_paths = []
-
-        # Validate root directory
-        if not os.path.isdir(root_directory):
-            raise ValueError(f"Invalid directory: {root_directory}")
-
-        # Image file extensions
+        self.file_hash_cache = {}  # Store file hashes for change detection
+        self.last_indexed_time = None
+        # Supported image file extensions
         self.IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp')
-
-        # Initialize models
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
         # Semantic concept mappings for improved matching
         self.semantic_concepts = {
             'fire': ['fire', 'flame', 'burning', 'blaze', 'inferno', 'fireball'],
@@ -55,41 +48,29 @@ class AdvancedImageIndexer:
             'animal': ['animal', 'creature', 'beast', 'wildlife', 'mammal', 'predator'],
         }
 
-    def find_image_files(self) -> List[str]:
-        """
-        Find all image files in the root directory and subdirectories
+        # Validate root directory
+        if not os.path.isdir(root_directory):
+            raise ValueError(f"Invalid directory: {root_directory}")
 
-        Returns:
-            List of full paths to image files
-        """
-        image_files = []
-        for subdir, _, files in os.walk(self.root_directory):
-            for file in files:
-                # Check file extension
-                if file.lower().endswith(self.IMAGE_EXTENSIONS):
-                    full_path = os.path.join(subdir, file)
-                    image_files.append(full_path)
+        # Initialize model
+        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-        logger.info(f"Found {len(image_files)} image files")
-        return image_files
+        # Add a new attribute for tracking pending updates
+        self.pending_updates = set()
+        # Add a small delay timer to batch updates
+        self.update_timer = None
 
-    def is_valid_image(self, file_path: str) -> bool:
-        """
-        Validate if an image can be opened and processed
-        """
+    def compute_file_hash(self, file_path: str) -> str:
+        """Compute a hash for the file to detect changes."""
         try:
-            with Image.open(file_path) as img:
-                # Check image dimensions and mode
-                if img.width < 10 or img.height < 10:
-                    return False
-
-                # Convert to RGB to ensure compatibility
-                img.convert("RGB")
-
-                return True
+            hasher = hashlib.md5()
+            with open(file_path, 'rb') as f:
+                hasher.update(f.read())
+            return hasher.hexdigest()
         except Exception as e:
-            logger.warning(f"Invalid image {file_path}: {e}")
-            return False
+            logger.warning(f"Could not hash file {file_path}: {e}")
+            return ""
 
     def get_image_embedding(self, file_path: str) -> Optional[np.ndarray]:
         """
@@ -149,108 +130,218 @@ class AdvancedImageIndexer:
             logger.error(f"Text embedding generation failed: {e}")
             return None
 
-    def index_files(self) -> Tuple[Optional[faiss.Index], List[str]]:
+    def is_valid_image(self, file_path: str) -> bool:
         """
-        Advanced file indexing with comprehensive error handling
+        Validate if an image can be opened and processed
+        """
+        try:
+            with Image.open(file_path) as img:
+                # Check image dimensions and mode
+                if img.width < 10 or img.height < 10:
+                    return False
 
-        Returns:
-            Tuple of Faiss index and file paths
+                # Convert to RGB to ensure compatibility
+                img.convert("RGB")
+
+                return True
+        except Exception as e:
+            logger.warning(f"Invalid image {file_path}: {e}")
+            return False
+
+    def load_cache(self):
+        """Load cached index if available."""
+        if os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path, 'rb') as f:
+                    data = pickle.load(f)
+                    self.index = data['index']
+                    self.file_paths = data['file_paths']
+                    self.file_hash_cache = data.get('file_hash_cache', {})
+                    self.last_indexed_time = data.get('last_indexed_time', None)
+                    logger.info("Loaded cached index.")
+            except Exception as e:
+                logger.error(f"Failed to load cache: {e}")
+
+    def save_cache(self):
+        """Save the current index and file paths to cache."""
+        try:
+            with open(self.cache_path, 'wb') as f:
+                pickle.dump({
+                    'index': self.index,
+                    'file_paths': self.file_paths,
+                    'file_hash_cache': self.file_hash_cache,
+                    'last_indexed_time': self.last_indexed_time,
+                }, f)
+                logger.info("Cache saved.")
+        except Exception as e:
+            logger.error(f"Failed to save cache: {e}")
+
+    def index_files(self, force_full_reload=False):
         """
-        # Find image files
+        Index new or changed files with optional force full reload.
+        Improved to handle batch updates and reduce unnecessary reindexing.
+        """
+        # If force_full_reload is True or no index exists, do a complete reload
+        if force_full_reload or self.index is None:
+            logger.info("Performing full index reload")
+            self.reload_index()
+            return
+
         all_image_files = self.find_image_files()
+        new_or_updated_files = []
 
-        if not all_image_files:
-            logger.warning("No image files found in the specified directory")
-            return None, []
-
-        # Initialize Faiss index
-        index = faiss.IndexFlatL2(512)
-        valid_file_paths = []
-        embeddings = []
-
-        # Process image files
+        # Track files that need indexing
         for file_path in all_image_files:
-            # Skip if image cannot be processed
-            if not self.is_valid_image(file_path):
-                logger.warning(f"Skipping invalid image: {file_path}")
+            current_hash = self.compute_file_hash(file_path)
+            if self.file_hash_cache.get(file_path) != current_hash:
+                new_or_updated_files.append(file_path)
+                self.file_hash_cache[file_path] = current_hash
+
+        if not new_or_updated_files:
+            logger.info("No new or updated files detected.")
+            return
+
+        embeddings = []
+        for file_path in new_or_updated_files:
+            if file_path in self.failed_files:
+                logger.info(f"Skipping previously failed file: {file_path}")
                 continue
 
-            # Get image embedding
-            embedding = self.get_image_embedding(file_path)
+            if self.is_valid_image(file_path):
+                embedding = self.get_image_embedding(file_path)
+                if embedding is not None:
+                    embeddings.append((file_path, embedding))
+                else:
+                    self.failed_files.add(file_path)
+                    logger.error(f"Failed to generate embedding for: {file_path}")
 
-            # Validate embedding
-            if embedding is not None and np.any(embedding):
-                embeddings.append(embedding)
-                valid_file_paths.append(file_path)
+        if embeddings:
+            # If index doesn't exist, create it
+            if self.index is None:
+                self.index = faiss.IndexFlatL2(512)
 
-        # Check if we have any valid embeddings
-        if not embeddings:
-            logger.error("No valid image embeddings could be generated")
-            return None, []
+            # Safely add new embeddings
+            new_embeddings = np.array([embed[1] for embed in embeddings])
+            self.index.add(new_embeddings)
+            self.file_paths.extend([embed[0] for embed in embeddings])
 
-        # Add embeddings to index
-        embeddings_array = np.stack(embeddings)
-        index.add(embeddings_array)
+            # Save cache and log
+            self.save_cache()
+            logger.info(f"Indexed {len(new_embeddings)} new or updated files.")
 
-        logger.info(f"Successfully indexed {len(valid_file_paths)} files")
+    def update_index_with_retry(self, max_retries=3):
+        """
+        Safely update index with retry mechanism to handle potential race conditions.
+        """
+        for attempt in range(max_retries):
+            try:
+                # Try to index files with some delay between attempts
+                self.index_files()
+                break
+            except Exception as e:
+                logger.warning(f"Indexing attempt {attempt + 1} failed: {e}")
+                time.sleep(0.5)  # Short delay between retries
 
-        # Set the index and file paths
-        self.index = index
-        self.file_paths = valid_file_paths
+    def reload_index(self):
+        """Reload the FAISS index from scratch and synchronize file paths."""
+        try:
+            embeddings = []
+            valid_file_paths = []
 
-        return index, valid_file_paths
+            for file_path in self.find_image_files():
+                if file_path in self.failed_files:
+                    logger.info(f"Skipping previously failed file during reload: {file_path}")
+                    continue
+
+                embedding = self.get_image_embedding(file_path)
+                if embedding is not None:
+                    embeddings.append(embedding)
+                    valid_file_paths.append(file_path)
+                else:
+                    self.failed_files.add(file_path)  # Track failures
+
+            if embeddings:
+                self.index = faiss.IndexFlatL2(512)
+                self.index.add(np.array(embeddings))
+                self.file_paths = valid_file_paths
+                logger.info(f"FAISS index reloaded with {len(self.file_paths)} files.")
+            else:
+                self.index = None
+                self.file_paths = []  # Clear file paths if no embeddings
+                logger.warning("No embeddings found for reloading index.")
+        except Exception as e:
+            logger.error(f"Failed to reload FAISS index: {e}")
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[str, float, float]]:
-        """
-        Semantic search across indexed images
-
-        Args:
-            query (str): Search query
-            top_k (int): Number of top results to return
-
-        Returns:
-            List of tuples containing (file_path, distance, similarity)
-        """
-        # Check if index is initialized
+        """Semantic search across indexed images."""
         if self.index is None or len(self.file_paths) == 0:
-            logger.warning("No images indexed")
+            logger.warning("No images indexed. Search aborted.")
             return []
 
         try:
-            # Generate query embedding
-            query_embedding = self.get_text_embedding(query)
+            # Debug log for validation
+            logger.debug(f"FAISS index total entries: {self.index.ntotal}")
+            logger.debug(f"File paths count: {len(self.file_paths)}")
 
+            query_embedding = self.get_text_embedding(query)
             if query_embedding is None:
-                logger.error("Failed to generate query embedding")
+                logger.error("Failed to generate query embedding.")
                 return []
 
-            # Expand query with semantic concepts
-            for concept, synonyms in self.semantic_concepts.items():
-                if concept in query.lower():
-                    query += " " + " ".join(synonyms)
-
-            # Reshape query embedding
             query_embedding = query_embedding.reshape(1, -1)
 
-            # Perform search
             distances, indices = self.index.search(query_embedding, top_k)
 
-            # Prepare results
             results = []
             for dist, idx in zip(distances[0], indices[0]):
-                # Compute similarity (inverse of distance)
-                similarity = 1 / (1 + dist)
-
-                # Get file path
-                file_path = self.file_paths[idx]
-
-                results.append((file_path, dist, similarity))
+                if 0 <= idx < len(self.file_paths):
+                    file_path = self.file_paths[idx]
+                    similarity = 1 / (1 + dist)
+                    results.append((file_path, dist, similarity))
 
             return results
-
         except Exception as e:
             logger.error(f"Search failed: {e}")
             return []
+
+    def find_image_files(self) -> List[str]:
+        """Find all image files in the root directory."""
+        return [
+            os.path.join(subdir, file)
+            for subdir, _, files in os.walk(self.root_directory)
+            for file in files
+            if file.lower().endswith(self.IMAGE_EXTENSIONS)
+        ]
+
+
+class DirectoryMonitor(FileSystemEventHandler):
+    def __init__(self, indexer, main_window):
+        self.indexer = indexer
+        self.main_window = main_window
+
+    def _schedule_update(self):
+        """
+        Schedule a delayed update using thread-safe method
+        """
+        logger.info("Scheduling update via thread-safe method")
+        # Use QMetaObject.invokeMethod to safely call across threads
+        QMetaObject.invokeMethod(
+            self.main_window,
+            "schedule_index_update",
+            Qt.QueuedConnection
+        )
+
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        logger.info(f"File modified: {event.src_path}. Scheduling update.")
+        self._schedule_update()
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        logger.info(f"File created: {event.src_path}. Scheduling update.")
+        self._schedule_update()
 
 
 class AdvancedImageIndexerGUI(QMainWindow):
@@ -260,7 +351,7 @@ class AdvancedImageIndexerGUI(QMainWindow):
         # Setup indexer
         try:
             self.indexer = AdvancedImageIndexer(root_directory)
-            self.index_images()
+            self.indexer.load_cache()
         except ValueError as e:
             QMessageBox.critical(self, "Error", str(e))
             sys.exit(1)
@@ -295,17 +386,21 @@ class AdvancedImageIndexerGUI(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
-    def index_images(self):
-        """
-        Index images and handle errors
-        """
-        try:
-            self.indexer.index_files()
+        # Create timer for delayed updates
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self._perform_delayed_update)
 
-            if not self.indexer.index or not self.indexer.file_paths:
-                QMessageBox.warning(self, "Indexing Failed", "No valid images found for indexing.")
-        except Exception as e:
-            QMessageBox.critical(self, "Indexing Error", str(e))
+        # Add initial full index after setup
+        self.index_images(force_full_reload=True)
+
+    @pyqtSlot()
+    def schedule_index_update(self):
+        """
+        Thread-safe method to schedule index updates
+        """
+        if not self.update_timer.isActive():
+            self.update_timer.start(500)  # 500ms delay to batch updates
 
     def perform_search(self):
         """
@@ -334,13 +429,13 @@ class AdvancedImageIndexerGUI(QMainWindow):
                 pixmap = QPixmap.fromImage(image).scaled(200, 200, Qt.KeepAspectRatio)
                 image_label.setPixmap(pixmap)
 
-                desc_label = QLabel(f"{os.path.basename(file_path)}\nDistance: {dist:.2f}\nSimilarity: {similarity:.2f}")
+                desc_label = QLabel(
+                    f"{os.path.basename(file_path)}\nDistance: {dist:.2f}\nSimilarity: {similarity:.2f}")
                 self.results_layout.addWidget(image_label, idx // 4, (idx % 4) * 2)
                 self.results_layout.addWidget(desc_label, idx // 4, (idx % 4) * 2 + 1)
 
         except Exception as e:
             QMessageBox.critical(self, "Search Error", str(e))
-
     def clear_results(self):
         """
         Clear previous search results from the layout
@@ -350,14 +445,54 @@ class AdvancedImageIndexerGUI(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+    def index_images(self, force_full_reload=False):
+        """
+        Index images and handle errors
+        """
+        try:
+            self.indexer.index_files(force_full_reload=force_full_reload)
 
+            if not self.indexer.index or not self.indexer.file_paths:
+                QMessageBox.warning(self, "Indexing Failed", "No valid images found for indexing.")
+        except Exception as e:
+            QMessageBox.critical(self, "Indexing Error", str(e))
 
-if __name__ == "__main__":
+    def _perform_delayed_update(self):
+        """
+        Perform delayed index update in the main thread
+        """
+        try:
+            logger.info("Performing delayed index update")
+            self.indexer.update_index_with_retry()
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+
+    # ... [rest of the methods remain the same]
+
+def main():
+    # Specify the directory to watch and index
+    root_directory = "/Users/ericlivesay/test_pic_indexer/"
+
+    # Initialize the application
     app = QApplication(sys.argv)
 
-    root_directory = "/Users/ericlivesay/test_pic_indexer/"  # Set your image directory path here
+    # Create the main window
     window = AdvancedImageIndexerGUI(root_directory)
     window.show()
 
-    sys.exit(app.exec_())
+    # Setup directory monitoring
+    observer = Observer()
+    monitor = DirectoryMonitor(window.indexer, window)
+    observer.schedule(monitor, root_directory, recursive=True)
+    observer.start()
 
+    try:
+        # Run the application
+        sys.exit(app.exec_())
+    finally:
+        # Ensure observer is stopped and cleaned up
+        observer.stop()
+        observer.join()
+
+if __name__ == "__main__":
+    main()
